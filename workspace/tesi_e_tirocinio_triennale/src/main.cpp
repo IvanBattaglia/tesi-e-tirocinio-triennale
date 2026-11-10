@@ -1,136 +1,83 @@
 #include <Arduino.h>
         #include <micro_ros_arduino.h>
-
+        #include <stdio.h>
         #include <rcl/rcl.h>
         #include <rcl/error_handling.h>
         #include <rclc/rclc.h>
-        #include <std_msgs/msg/string.h>
+        #include <rclc/executor.h>
+        #include <std_msgs/msg/int32_multi_array.h>
 
-        /* Header C per il ping e la gestione dell'agente micro-ROS */
-        #include <rmw_microros/rmw_microros.h>
+        // Inclusione dell'header personalizzato per i timer GPT
+        #include "encoder_qei.h"
 
-        static rcl_publisher_t publisher;
-        static std_msgs__msg__String msg;
-        static rclc_support_t support;
-        static rcl_allocator_t allocator;
-        static rcl_node_t node;
+        rcl_publisher_t publisher;
+        std_msgs__msg__Int32MultiArray msg;
+        rclc_executor_t executor;
+        rclc_support_t support;
+        rcl_allocator_t allocator;
+        rcl_node_t node;
+        rcl_timer_t timer;
 
-        /* Buffer di memoria per memorizzare la stringa */
-        static char msg_buffer[50];
+        // Array statico contenente i passi dei due encoder
+        static int32_t encoder_data[2];
 
-        // Stato della connessione micro-ROS
-        enum States
+        void timer_callback(rcl_timer_t *timer, int64_t last_call_time)
         {
-            WAITING_AGENT,
-            AGENT_AVAILABLE,
-            AGENT_CONNECTED,
-            AGENT_DISCONNECTED
-        } state;
+            (void)last_call_time;
+            if (timer != NULL)
+            {
+                // Lettura istantanea diretta dai registri contatore hardware a 32-bit (senza overhead CPU)
+                msg.data.data[0] = getEncoder0Ticks();
+                msg.data.data[1] = getEncoder1Ticks();
 
-        /* Distrugge le entità create in precedenza per consentire un nuovo init pulito */
-        void destroy_entities(void)
-        {
-            rmw_context_t *rmw_context = rcl_context_get_rmw_context(&support.context);
-            (void)rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
-
-            rcl_publisher_fini(&publisher, &node);
-            rcl_node_fini(&node);
-            rclc_support_fini(&support);
+                // Pubblicazione sul topic ROS2
+                rcl_publish(&publisher, &msg, NULL);
+            }
         }
 
-        /* Inizializza le entità ROS 2 (Allocatore, Nodo, Publisher, Messaggio) */
-        bool create_entities(void)
+        void setup()
         {
-            allocator = rcl_get_default_allocator();
-
-            if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK)
-            {
-                return false;
-            }
-
-            if (rclc_node_init_default(&node, "arduino_hello_node", "", &support) != RCL_RET_OK)
-            {
-                return false;
-            }
-
-            if (rclc_publisher_init_default(
-                    &publisher,
-                    &node,
-                    ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
-                    "micro_ros_string") != RCL_RET_OK)
-            {
-                return false;
-            }
-
-            msg.data.data = msg_buffer;
-            msg.data.capacity = sizeof(msg_buffer);
-            snprintf(msg.data.data, msg.data.capacity, "Hello World from Arduino UNO R4!");
-            msg.data.size = strlen(msg.data.data);
-
-            return true;
-        }
-
-        void setup(void)
-        {
-            /* Configura la seriale USB per il trasporto micro-ROS */
+            // Inizializzazione del trasporto micro-ROS (porta USB Seriale nativa dell'Arduino Uno R4)
             set_microros_transports();
 
-            pinMode(LED_BUILTIN, OUTPUT);
-            (LED_BUILTIN, LOW);
+            // Configurazione hardware dei timer GPT320 e GPT321 in Phase Counting Mode 4 (4x)
+            setupGPT_QEI();
 
-            state = WAITING_AGENT;
+            allocator = rcl_get_default_allocator();
+
+            // Inizializzazione della struttura di supporto micro-ROS
+            rclc_support_init(&support, 0, NULL, &allocator);
+
+            // Creazione del nodo ROS2
+            rclc_node_init_default(&node, "arduino_encoder_node", "", &support);
+
+            // Inizializzazione del Publisher sul topic "encoder_ticks"
+            rclc_publisher_init_default(
+                &publisher,
+                &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray),
+                "encoder_ticks");
+
+            // Collegamento del buffer statico all'array dinamico della struttura del messaggio ROS2
+            msg.data.capacity = 2;
+            msg.data.size = 2;
+            msg.data.data = encoder_data;
+
+            // Configurazione del timer di pubblicazione micro-ROS a 50 Hz (periodo = 20 ms)
+            const unsigned int timer_timeout = 20;
+            rclc_timer_init_default(
+                &timer,
+                &support,
+                RCL_MS_TO_NS(timer_timeout),
+                timer_callback);
+
+            // Inizializzazione dell'executor micro-ROS
+            rclc_executor_init(&executor, &support.context, 1, &allocator);
+            rclc_executor_add_timer(&executor, &timer);
         }
 
-        void loop(void)
+        void loop()
         {
-            // implemento una Macchina a Stati Finiti (FSM - Finite State Machine)
-            switch (state)
-            {
-            case WAITING_AGENT:
-                // Verifica se l'agente è attivo (ping rapido ogni 100ms)
-                if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK)
-                {
-                    state = AGENT_AVAILABLE;
-                }
-                else
-                {
-                    // Fa lampeggiare il LED arancione finché l'agente non c'è
-                    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-                    delay(100);
-                }
-                break;
-
-            case AGENT_AVAILABLE:
-                // Tenta di creare le entità ROS 2
-                if (create_entities())
-                {
-                    state = AGENT_CONNECTED;
-                    digitalWrite(LED_BUILTIN, HIGH); // LED fisso: connesso e operativo
-                }
-                else
-                {
-                    state = WAITING_AGENT;
-                }
-                break;
-
-            case AGENT_CONNECTED:
-                // Controlla se l'agente è ancora vivo prima di pubblicare
-                if (rmw_uros_ping_agent(100, 1) == RMW_RET_OK)
-                {
-                    rcl_publish(&publisher, &msg, NULL);
-                    delay(1000); // Frequenza di pubblicazione 1Hz
-                }
-                else
-                {
-                    state = AGENT_DISCONNECTED;
-                }
-                break;
-
-            case AGENT_DISCONNECTED:
-                // Spegne il LED, pulisce la sessione fallita e torna in attesa
-                digitalWrite(LED_BUILTIN, LOW);
-                destroy_entities();
-                state = WAITING_AGENT;
-                break;
-            }
+            // Esecuzione periodica dei task micro-ROS e dispatching delle callback
+            rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
         }
