@@ -1,0 +1,27 @@
+services:
+  # Shell di lavoro: ROS 2 Humble + micro_ros_setup
+  ros:
+    build: .
+    image: ros2-humble-microros
+    container_name: ros2_humble
+    stdin_open: true
+    tty: true
+    environment:
+      - DISPLAY=${DISPLAY:-host.docker.internal:0.0}   # per rviz/rqt (WSLg o VcXsrv)
+      - ROS_DOMAIN_ID=0
+    volumes:
+      - ./workspace:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /dev:/dev
+    # per seriale/USB (dopo usbipd attach, vedi ISTRUZIONI.md) decommentare:
+    privileged: true
+
+  # Agent micro-ROS Seriale
+  agent:
+    image: microros/micro-ros-agent:humble
+    container_name: microros_agent
+    profiles: ["agent"]
+    privileged: true
+    command: serial --dev /dev/ttyACM0 -b 115200 -v4
+    volumes:
+      - /dev:/dev
