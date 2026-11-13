@@ -1,4 +1,4 @@
-/* #include "encoder_qei.h"
+#include "encoder_qei.h"
 #include <bsp_api.h>
 
 void setupGPT_QEI(void)
@@ -35,4 +35,4 @@ void setupGPT_QEI(void)
 int32_t getEncoderTicks(void)
 {
     return (int32_t)R_GPT0->GTCNT;
-}*/
+}

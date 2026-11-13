@@ -7,8 +7,11 @@
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
+#include <std_msgs/msg/int32.h>
 #include <Adafruit_MotorShield.h>
 #include <rmw_microros/rmw_microros.h>
+
+#include "encoder_qei.h"
 
 // --- Oggetti ROS2 ---
 rcl_subscription_t subscriber;
@@ -17,6 +20,10 @@ rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
+
+rcl_publisher_t publisher;
+std_msgs__msg__Int32 enc_msg;
+rcl_timer_t timer;
 
 // --- Oggetto Motore (Solo Motore 1) ---
 Adafruit_MotorShield AFMS = Adafruit_MotorShield();
@@ -34,6 +41,15 @@ enum States {
 void stop_motors() {
   motor1->setSpeed(0);
   motor1->run(RELEASE);
+}
+
+// Timer callback eseguito ogni 10 secondi per inviare i tick dell'encoder
+void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
+    (void)last_call_time;
+    if (timer != NULL) {
+        enc_msg.data = getEncoderTicks();
+        rcl_publish(&publisher, &enc_msg, NULL);
+    }
 }
 
 void twist_callback(const void *msgin) {
@@ -61,6 +77,8 @@ void destroy_entities() {
   (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
 
   geometry_msgs__msg__Twist__fini(&msg_sub);
+  rcl_publisher_fini(&publisher, &node);
+  rcl_timer_fini(&timer);
   rcl_subscription_fini(&subscriber, &node);
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
@@ -81,9 +99,23 @@ bool create_entities() {
 
   geometry_msgs__msg__Twist__init(&msg_sub);
 
-  // Executor con 1 solo handle (il subscriber)
-  if (rclc_executor_init(&executor, &support.context, 1, &allocator) != RCL_RET_OK) return false;
+  // Publisher /encoder_ticks (Tipo std_msgs/msg/Int32)
+  if (rclc_publisher_init_default(
+        &publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
+        "encoder_ticks") != RCL_RET_OK) return false;
+
+  // Timer a 10 secondi (10000 ms) per la lettura dell'encoder
+  const unsigned int timer_timeout = 10000;
+  if (rclc_timer_init_default(
+        &timer, &support,
+        RCL_MS_TO_NS(timer_timeout),
+        timer_callback) != RCL_RET_OK) return false;
+
+  // Executor con 2 handles (1 subscriber + 1 timer)
+  if (rclc_executor_init(&executor, &support.context, 2, &allocator) != RCL_RET_OK) return false;
   rclc_executor_add_subscription(&executor, &subscriber, &msg_sub, &twist_callback, ON_NEW_DATA);
+  rclc_executor_add_timer(&executor, &timer);
 
   return true;
 }
@@ -94,9 +126,13 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, LOW);
 
+    // 1. Prima inizializza I2C e la Motor Shield
     Wire.begin();
     Wire.setClock(100000);
     AFMS.begin();
+
+    // 2. Poi inizializza i due timer GPT a 32 bit
+    setupGPT_QEI();
 
     state = WAITING_AGENT;
 }

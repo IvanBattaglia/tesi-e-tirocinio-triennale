@@ -1,4 +1,4 @@
-/* #ifndef ENCODER_QEI_H
+#ifndef ENCODER_QEI_H
 #define ENCODER_QEI_H
 
 #include <stdint.h>
@@ -8,7 +8,7 @@ extern "C"
 {
 #endif
 
-    // Inizializza il timer GPT320 in Phase Counting Mode per 1 solo encoder (Pin D6/D7)
+    // Inizializza il timer GPT320 in Phase Counting Mode per l'encoder (Pin D6/D7)
     void setupGPT_QEI(void);
 
     // Restituisce i tick accumulati dall'Encoder (Pin D6/D7 -> P106/P107) a 32 bit con segno
@@ -18,4 +18,4 @@ extern "C"
 }
 #endif
 
-#endif // ENCODER_QEI_H   */
+#endif // ENCODER_QEI_H
