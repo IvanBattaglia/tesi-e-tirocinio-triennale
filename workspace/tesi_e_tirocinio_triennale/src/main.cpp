@@ -2,14 +2,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <micro_ros_arduino.h>
-#include <stdio.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/int32_multi_array.h>
-#include <std_msgs/msg/float32_multi_array.h>
 #include <Adafruit_MotorShield.h>
 #include <rmw_microros/rmw_microros.h>
 #include <PID_v1.h> // Libreria PID di Brett Beauregard
@@ -35,7 +33,7 @@ const double TICKS_TO_RAD = (2.0 * PI) / TICKS_PER_REV;
 const double PID_SAMPLE_TIME_MS = 20.0; // 50 Hz
 
 // Guadagni PID tarati per ingresso in rad/s e uscita PWM (-255..255) e calcolati sul guadagno statico K ≈ 0.0255 dei Faulhaber a 12V
-double Kp = 26.0, Ki = 180.0, Kd = 0.0;
+double Kp = 0.0, Ki = 0.0, Kd = 0.0;
 
 // Variabili PID (devono essere tutte double per la libreria PID_v1)
 double setpoint1 = 0, input1 = 0, output1 = 0; // Motore 1 (Sinistro / Enc 0)
@@ -66,10 +64,9 @@ int32_t enc_data[2] = {0, 0};
 rcl_publisher_t vel_publisher;
 geometry_msgs__msg__Twist vel_msg;
 
-// Publisher 3: Dati completi per taratura PID (7 float)
+// Publisher 3: Dati completi per taratura PID (6 valori su Twist)
 rcl_publisher_t pid_debug_publisher;
-std_msgs__msg__Float32MultiArray pid_debug_msg;
-float pid_debug_data[7] = {0.0f};
+geometry_msgs__msg__Twist pid_debug_msg;
 
 rcl_timer_t timer;
 
@@ -90,7 +87,7 @@ static unsigned long last_ping_time = 0;
 static unsigned long last_cmd_time = 0;
 
 // Watchdog di sicurezza CMD_TIMEOUT_MS = imposta il valore voluto in ms
-const unsigned long CMD_TIMEOUT_MS = 10000; // Watchdog: ferma i motori se /cmd_vel sparisce
+const unsigned long CMD_TIMEOUT_MS = 5000; // Watchdog: ferma i motori se /cmd_vel sparisce
 
 enum States {
   WAITING_AGENT,
@@ -172,14 +169,13 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     vel_msg.linear.y = input2;
     rcl_publish(&vel_publisher, &vel_msg, NULL);
 
-    // 7. Pubblicazione telemetria PID
-    pid_debug_msg.data.data[0] = now / 1000.0f;      // Tempo [s]
-    pid_debug_msg.data.data[1] = (float)setpoint1;   // Target SX [rad/s]
-    pid_debug_msg.data.data[2] = (float)input1;      // Reale SX [rad/s]
-    pid_debug_msg.data.data[3] = (float)output1;     // PWM SX
-    pid_debug_msg.data.data[4] = (float)setpoint2;   // Target DX [rad/s]
-    pid_debug_msg.data.data[5] = (float)input2;      // Reale DX [rad/s]
-    pid_debug_msg.data.data[6] = (float)output2;     // PWM DX
+    // 7. Pubblicazione telemetria PID (6 valori su Twist)
+    pid_debug_msg.linear.x  = setpoint1; // Target SX [rad/s]
+    pid_debug_msg.linear.y  = input1;    // Reale SX [rad/s]
+    pid_debug_msg.linear.z  = output1;   // PWM SX [-255..255]
+    pid_debug_msg.angular.x = setpoint2; // Target DX [rad/s]
+    pid_debug_msg.angular.y = input2;    // Reale DX [rad/s]
+    pid_debug_msg.angular.z = output2;   // PWM DX [-255..255]
     rcl_publish(&pid_debug_publisher, &pid_debug_msg, NULL);
 }
 
@@ -227,12 +223,13 @@ void destroy_entities() {
   rcl_publisher_fini(&enc_publisher, &node);
   geometry_msgs__msg__Twist__fini(&vel_msg);
   rcl_publisher_fini(&vel_publisher, &node);
+  geometry_msgs__msg__Twist__fini(&pid_debug_msg);
+  rcl_publisher_fini(&pid_debug_publisher, &node);
   rcl_timer_fini(&timer);
   rcl_subscription_fini(&subscriber, &node);
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
-  rcl_publisher_fini(&pid_debug_publisher, &node);
 }
 
 bool create_entities() {
@@ -273,19 +270,13 @@ bool create_entities() {
         ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
         "wheel_vel") != RCL_RET_OK) return false;
 
-  // Inizializzazione memoria statica per /pid_debug
-  pid_debug_msg.data.capacity = 7;
-  pid_debug_msg.data.size = 7;
-  pid_debug_msg.data.data = pid_debug_data;
-  pid_debug_msg.layout.dim.capacity = 0;
-  pid_debug_msg.layout.dim.size = 0;
-  pid_debug_msg.layout.dim.data = NULL;
-  pid_debug_msg.layout.data_offset = 0;
+  // Inizializzazione messaggio Twist per /pid_debug
+  geometry_msgs__msg__Twist__init(&pid_debug_msg);
 
   // Publisher /pid_debug
   if (rclc_publisher_init_default(
         &pid_debug_publisher, &node,
-        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
         "pid_debug") != RCL_RET_OK) return false;
 
   // Timer a 50Hz (20 ms)
