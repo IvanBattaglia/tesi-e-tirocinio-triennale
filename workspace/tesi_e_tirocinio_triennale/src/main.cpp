@@ -11,8 +11,42 @@
 #include <std_msgs/msg/int32_multi_array.h>
 #include <Adafruit_MotorShield.h>
 #include <rmw_microros/rmw_microros.h>
+#include <PID_v1.h> // Libreria PID di Brett Beauregard
 
 #include "encoder_qei.h"
+
+// =========================================================================
+// 1. PARAMETRI FISICI DEL ROBOT (INSERISCI I VALORI REALI DEL TUO ROBOT!)
+// =========================================================================
+const double TICKS_PER_REV   = 86000.0; // Tick per 1 giro completo ruota (in quadratura 4x) = 500 CPR * 4 (QEI) * 43 (riduttore) = 86.000
+const double WHEEL_RADIUS_M  = 0.0485; // Raggio ruota in metri
+const double WHEEL_BASE_M    = 0.40;  // Distanza tra i centri delle due ruote in metri
+
+// Limite fisico di sicurezza per la singola ruota in rad/s
+const double MAX_WHEEL_RAD_S = 5.5;
+
+// Fattore di conversione precalcolato: (2 * PI) / TICKS_PER_REV
+const double TICKS_TO_RAD = (2.0 * PI) / TICKS_PER_REV;
+
+// =========================================================================
+// 2. PARAMETRI DEL CONTROLLORE PID (IN UNITÀ RAD/S -> PWM)
+// =========================================================================
+const double PID_SAMPLE_TIME_MS = 20.0; // 50 Hz
+
+// Guadagni PID tarati per ingresso in rad/s e uscita PWM (-255..255) e calcolati sul guadagno statico K ≈ 0.0255 dei Faulhaber a 12V
+double Kp = 26.0, Ki = 180.0, Kd = 0.0;
+
+// Variabili PID (devono essere tutte double per la libreria PID_v1)
+double setpoint1 = 0, input1 = 0, output1 = 0; // Motore 1 (Sinistro / Enc 0)
+double setpoint2 = 0, input2 = 0, output2 = 0; // Motore 2 (Destro / Enc 1)
+
+PID pid1(&input1, &output1, &setpoint1, Kp, Ki, Kd, DIRECT);
+PID pid2(&input2, &output2, &setpoint2, Kp, Ki, Kd, DIRECT);
+
+// Variabili per il calcolo della velocità dagli encoder
+int32_t prev_ticks0 = 0;
+int32_t prev_ticks1 = 0;
+unsigned long prev_vel_time = 0;
 
 // --- Oggetti ROS2 ---
 rcl_subscription_t subscriber;
@@ -22,9 +56,15 @@ rclc_support_t support;
 rcl_allocator_t allocator;
 rcl_node_t node;
 
-rcl_publisher_t publisher;
+// Publisher 1: Tick cumulativi encoder (per odometria)
+rcl_publisher_t enc_publisher;
 std_msgs__msg__Int32MultiArray enc_msg;
-int32_t enc_data[2] = {0, 0}; // Buffer statico per l'array micro-ROS
+int32_t enc_data[2] = {0, 0};
+
+// Publisher 2: Velocità ruote in rad/s [vel_sx, vel_dx]
+rcl_publisher_t vel_publisher;
+geometry_msgs__msg__Twist vel_msg;
+
 rcl_timer_t timer;
 
 // --- Oggetti Motore (M1 = Sinistro/Enc0, M2 = Destro/Enc1) ---
@@ -67,48 +107,100 @@ void set_single_motor(Adafruit_DCMotor *motor, int16_t pwm) {
 }
 
 void stop_motors() {
-  target_pwm1 = 0;
-  target_pwm2 = 0;
+  setpoint1 = 0;
+  setpoint2 = 0;
+  output1 = 0;
+  output2 = 0;
+  // Mettendo in MANUAL azzeriamo la memoria dell'integrale (anti-windup)
+  pid1.SetMode(MANUAL);
+  pid2.SetMode(MANUAL);
   set_single_motor(motor1, 0);
   set_single_motor(motor2, 0);
   last_pwm1 = 0;
   last_pwm2 = 0;
 }
 
-// Timer callback a 50Hz (20 ms) per pubblicare [encoder0, encoder1]
+// Timer callback a 50Hz (20 ms): legge encoder, calcola velocità e aggiorna PID
 void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     (void)last_call_time;
-    if (timer != NULL) {
-        enc_msg.data.data[0] = getEncoder0Ticks();
-        enc_msg.data.data[1] = getEncoder1Ticks();
-        rcl_publish(&publisher, &enc_msg, NULL);
+    if (timer == NULL) return;
+
+    unsigned long now = millis();
+    double dt = (now - prev_vel_time) / 1000.0; // Tempo trascorso in secondi (~0.020 s)
+    prev_vel_time = now;
+
+    // 1. Lettura tick attuali
+    int32_t curr_ticks0 = getEncoder0Ticks();
+    int32_t curr_ticks1 = getEncoder1Ticks();
+
+    // 2. Calcolo velocità reale delle ruote in RADIANTI AL SECONDO (rad/s)
+    // NOTA: verifica il segno! Se con PWM > 0 la velocità risulta negativa, inverti il segno qui
+    if (dt > 0.0) {
+        double delta_ticks0 = (double)(curr_ticks0 - prev_ticks0);
+        double delta_ticks1 = (double)(curr_ticks1 - prev_ticks1);
+
+        input1 = (delta_ticks0 * TICKS_TO_RAD) / dt;
+        input2 = (delta_ticks1 * TICKS_TO_RAD) / dt;
     }
+    prev_ticks0 = curr_ticks0;
+    prev_ticks1 = curr_ticks1;
+
+    // 3. Calcolo PID (confronta setpoint in rad/s con input in rad/s)
+    pid1.Compute();
+    pid2.Compute();
+
+    // 4. invio dei PWM calcolati al loop principale (che gestisce l'I2C)
+    if (pid1.GetMode() == AUTOMATIC) {
+        target_pwm1 = (int16_t)output1;
+        target_pwm2 = (int16_t)output2;
+        new_cmd = true;
+    }
+
+    // 5. Pubblicazione tick encoder
+    enc_msg.data.data[0] = curr_ticks0;
+    enc_msg.data.data[1] = curr_ticks1;
+    rcl_publish(&enc_publisher, &enc_msg, NULL);
+
+    // 6. Pubblicazione velocità ruote in rad/s
+    vel_msg.linear.x = input1;
+    vel_msg.linear.y = input2;
+    rcl_publish(&vel_publisher, &vel_msg, NULL);
 }
 
-// Callback /cmd_vel: calcola i PWM differenziali senza chiamare I2C
+// Callback /cmd_vel: converte v (m/s) e omega (rad/s) in velocità ruote (rad/s)
 void twist_callback(const void *msgin) {
   const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
-
-  // conferma visiva di ricesione del comando di moto
   digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
 
-  float linear = msg->linear.x;   // Avanti/Indietro (-1.0 a 1.0)
-  float angular = msg->angular.z; // Rotazione (-1.0 a 1.0)
+  last_cmd_time = millis();
 
-  // Miscelazione differenziale semplice (linear>0 = avanti; linear<0 = indietro; angular<0 = rotazione antioraria; angular>0 = rotazione oraria)
-  float left = linear + angular; // motore M2
-  float right = linear - angular; // motore M1
+  double v = msg->linear.x;      // Velocità lineare richiesta [m/s]
+  double omega = msg->angular.z; // Velocità angolare richiesta [rad/s]
 
-  // Normalizzazione se supera [-1.0, 1.0]
-  float max_val = max(fabs(left), fabs(right));
-  if (max_val > 1.0f) {
-    left /= max_val;
-    right /= max_val;
-  } // 1.0 e -1.0 corrispondono a 255 e -255 PWM, cioè alla masima velocità avanti e indietro del motore, quando usi un robot a cinematica differenziale (differential drive), calcoli le velocità delle due ruote sommando e sottraendo la velocità lineare v e quella angolare omega, se tale somma restituisce un valore > 1.0 o < -1.0, allora normalizzi i valori per non superare il range [-1.0, 1.0], così facendo, il robot, riduce leggermente la velocità di entrambi i motori ma esegue esattamente la curva comandata poichè il rapporto tra la velocità della ruota destra e sinistra rimane identico
+  // Cinematica inversa differential drive -> velocità angolare ruote [rad/s]
+  // Se ruotando a sinistra/destra il robot gira al contrario, inverti i segni - e +
+  double w_left  = (v - (omega * WHEEL_BASE_M / 2.0)) / WHEEL_RADIUS_M; // M1
+  double w_right = (v + (omega * WHEEL_BASE_M / 2.0)) / WHEEL_RADIUS_M; // M2
 
-  target_pwm1 = (int16_t)(left * 255.0f);
-  target_pwm2 = (int16_t)(right * 255.0f);
-  new_cmd = true;
+  // Saturazione proporzionale solo se si supera il limite fisico MAX_WHEEL_RAD_S
+  // In questo modo i tasti q/z/w/x/e/c di teleop_twist_keyboard modulano liberamente la velocità
+  double max_w = max(fabs(w_left), fabs(w_right));
+  if (max_w > MAX_WHEEL_RAD_S) {
+    double scale = MAX_WHEEL_RAD_S / max_w;
+    w_left  *= scale;
+    w_right *= scale;
+  }
+
+  setpoint1 = w_left;
+  setpoint2 = w_right;
+
+  // Soglia di arresto (es. sotto 0.05 rad/s ferma i motori)
+  if (fabs(setpoint1) < 0.05 && fabs(setpoint2) < 0.05) {
+      stop_motors();
+  } else {
+      pid1.SetMode(AUTOMATIC);
+      pid2.SetMode(AUTOMATIC);
+  }
 }
 
 void destroy_entities() {
@@ -116,7 +208,9 @@ void destroy_entities() {
   (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
 
   geometry_msgs__msg__Twist__fini(&msg_sub);
-  rcl_publisher_fini(&publisher, &node);
+  rcl_publisher_fini(&enc_publisher, &node);
+  geometry_msgs__msg__Twist__fini(&vel_msg);
+  rcl_publisher_fini(&vel_publisher, &node);
   rcl_timer_fini(&timer);
   rcl_subscription_fini(&subscriber, &node);
   rclc_executor_fini(&executor);
@@ -138,7 +232,7 @@ bool create_entities() {
 
   geometry_msgs__msg__Twist__init(&msg_sub);
 
-  // Inizializzazione memoria statica per std_msgs/msg/Int32MultiArray
+  // Inizializzazione memoria statica per /encoder_ticks
   enc_msg.data.capacity = 2;
   enc_msg.data.size = 2;
   enc_msg.data.data = enc_data;
@@ -149,9 +243,18 @@ bool create_entities() {
 
   // Publisher /encoder_ticks
   if (rclc_publisher_init_default(
-        &publisher, &node,
+        &enc_publisher, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32MultiArray),
         "encoder_ticks") != RCL_RET_OK) return false;
+
+  // Inizializzazione messaggio Twist per /wheel_vel (rad/s)
+  geometry_msgs__msg__Twist__init(&vel_msg);
+
+  // Publisher /wheel_vel
+  if (rclc_publisher_init_default(
+        &vel_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
+        "wheel_vel") != RCL_RET_OK) return false;
 
   // Timer a 50Hz (20 ms)
   const unsigned int timer_timeout = 20;
@@ -182,6 +285,15 @@ void setup() {
     // 2. Poi inizializza i due timer GPT a 32 bit
     setupGPT_QEI();
 
+    // Configurazione PID
+    pid1.SetOutputLimits(-255, 255);
+    pid2.SetOutputLimits(-255, 255);
+    pid1.SetSampleTime(PID_SAMPLE_TIME_MS);
+    pid2.SetSampleTime(PID_SAMPLE_TIME_MS);
+    pid1.SetMode(MANUAL); // Parte spento finché non arriva un comando
+    pid2.SetMode(MANUAL);
+
+    prev_vel_time = millis();
     state = WAITING_AGENT;
 }
 
@@ -212,7 +324,6 @@ void loop() {
       // Aggiorna i motori via I2C solo fuori dalla callback e solo se il valore è cambiato
       if (new_cmd) {
         new_cmd = false;
-        last_cmd_time = millis();
 
         int16_t p1 = target_pwm1;
         int16_t p2 = target_pwm2;
@@ -225,8 +336,10 @@ void loop() {
           set_single_motor(motor2, p2);
           last_pwm2 = p2;
         }
-      } else if (millis() - last_cmd_time > CMD_TIMEOUT_MS && (last_pwm1 != 0 || last_pwm2 != 0)) {
-        // Sicurezza: ferma i motori se non arrivano più comandi /cmd_vel
+    }
+
+    // Sicurezza: ferma i motori se non arrivano più comandi /cmd_vel per oltre CMD_TIMEOUT_MS
+    if (millis() - last_cmd_time > CMD_TIMEOUT_MS && (pid1.GetMode() == AUTOMATIC || last_pwm1 != 0 || last_pwm2 != 0)) {
         stop_motors();
       }
 
