@@ -9,6 +9,7 @@
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
 #include <std_msgs/msg/int32_multi_array.h>
+#include <std_msgs/msg/float32_multi_array.h>
 #include <Adafruit_MotorShield.h>
 #include <rmw_microros/rmw_microros.h>
 #include <PID_v1.h> // Libreria PID di Brett Beauregard
@@ -65,6 +66,11 @@ int32_t enc_data[2] = {0, 0};
 rcl_publisher_t vel_publisher;
 geometry_msgs__msg__Twist vel_msg;
 
+// Publisher 3: Dati completi per taratura PID (7 float)
+rcl_publisher_t pid_debug_publisher;
+std_msgs__msg__Float32MultiArray pid_debug_msg;
+float pid_debug_data[7] = {0.0f};
+
 rcl_timer_t timer;
 
 // --- Oggetti Motore (M1 = Sinistro/Enc0, M2 = Destro/Enc1) ---
@@ -83,8 +89,8 @@ int16_t last_pwm2 = 999;
 static unsigned long last_ping_time = 0;
 static unsigned long last_cmd_time = 0;
 
-// Watchdog di sicurezza CMD_TIMEOUT_MS = 500 ms: se usi teleop_twist_keyboard per testare il robot, ricorda che la tastiera invia comandi solo alla pressione dei tasti (quindi il robot si fermerà dopo mezzo secondo dal rilascio, evitando che scappi via se cade la connessione). Se invece invii comandi singoli da terminale con ros2 topic pub --once, aumenta temporaneamente CMD_TIMEOUT_MS o commenta il blocco else if.
-const unsigned long CMD_TIMEOUT_MS = 500; // Watchdog: ferma i motori se /cmd_vel sparisce
+// Watchdog di sicurezza CMD_TIMEOUT_MS = imposta il valore voluto in ms
+const unsigned long CMD_TIMEOUT_MS = 10000; // Watchdog: ferma i motori se /cmd_vel sparisce
 
 enum States {
   WAITING_AGENT,
@@ -165,6 +171,16 @@ void timer_callback(rcl_timer_t *timer, int64_t last_call_time) {
     vel_msg.linear.x = input1;
     vel_msg.linear.y = input2;
     rcl_publish(&vel_publisher, &vel_msg, NULL);
+
+    // 7. Pubblicazione telemetria PID
+    pid_debug_msg.data.data[0] = now / 1000.0f;      // Tempo [s]
+    pid_debug_msg.data.data[1] = (float)setpoint1;   // Target SX [rad/s]
+    pid_debug_msg.data.data[2] = (float)input1;      // Reale SX [rad/s]
+    pid_debug_msg.data.data[3] = (float)output1;     // PWM SX
+    pid_debug_msg.data.data[4] = (float)setpoint2;   // Target DX [rad/s]
+    pid_debug_msg.data.data[5] = (float)input2;      // Reale DX [rad/s]
+    pid_debug_msg.data.data[6] = (float)output2;     // PWM DX
+    rcl_publish(&pid_debug_publisher, &pid_debug_msg, NULL);
 }
 
 // Callback /cmd_vel: converte v (m/s) e omega (rad/s) in velocità ruote (rad/s)
@@ -216,6 +232,7 @@ void destroy_entities() {
   rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
+  rcl_publisher_fini(&pid_debug_publisher, &node);
 }
 
 bool create_entities() {
@@ -255,6 +272,21 @@ bool create_entities() {
         &vel_publisher, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist),
         "wheel_vel") != RCL_RET_OK) return false;
+
+  // Inizializzazione memoria statica per /pid_debug
+  pid_debug_msg.data.capacity = 7;
+  pid_debug_msg.data.size = 7;
+  pid_debug_msg.data.data = pid_debug_data;
+  pid_debug_msg.layout.dim.capacity = 0;
+  pid_debug_msg.layout.dim.size = 0;
+  pid_debug_msg.layout.dim.data = NULL;
+  pid_debug_msg.layout.data_offset = 0;
+
+  // Publisher /pid_debug
+  if (rclc_publisher_init_default(
+        &pid_debug_publisher, &node,
+        ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+        "pid_debug") != RCL_RET_OK) return false;
 
   // Timer a 50Hz (20 ms)
   const unsigned int timer_timeout = 20;
