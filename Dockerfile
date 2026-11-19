@@ -7,6 +7,7 @@ ENV ROS_DISTRO=humble
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git curl wget nano \
         python3 python3-pip python3-venv \
+        python3-pandas python3-numpy python3-matplotlib \
         python3-colcon-common-extensions \
         python3-rosdep python3-vcstool \
         ros-humble-micro-ros-msgs \

@@ -33,7 +33,7 @@ const double TICKS_TO_RAD = (2.0 * PI) / TICKS_PER_REV;
 const double PID_SAMPLE_TIME_MS = 20.0; // 50 Hz
 
 // Guadagni PID tarati per ingresso in rad/s e uscita PWM (-255..255) e calcolati sul guadagno statico K ≈ 0.0255 dei Faulhaber a 12V
-double Kp = 0.0, Ki = 0.0, Kd = 0.0;
+double Kp = 10.0, Ki = 0.0, Kd = 0.0;
 
 // Variabili PID (devono essere tutte double per la libreria PID_v1)
 double setpoint1 = 0, input1 = 0, output1 = 0; // Motore 1 (Sinistro / Enc 0)
